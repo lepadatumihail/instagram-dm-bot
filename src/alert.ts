@@ -23,5 +23,7 @@ export async function alert(kind: string, text: string): Promise<void> {
       text: `Instagram bot: ${text}`,
       link_preview_options: { is_disabled: true },
     }),
+    // An alert must never hold up the work it reports on.
+    signal: AbortSignal.timeout(10_000),
   }).catch(() => undefined);
 }

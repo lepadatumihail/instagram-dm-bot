@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
-import { after, beforeEach, describe, it } from "node:test";
+import { after, afterEach, beforeEach, describe, it } from "node:test";
 import { DAY, HOUR, MINUTE } from "../src/config.ts";
-import { closeDb, commentSettled, kvGet, kvSet, openDb } from "../src/db.ts";
-import { BUTTON, handleWebhook } from "../src/instagram/bot.ts";
+import { closeDb, commentStatus, kvGet, kvSet, openDb } from "../src/db.ts";
+import { handleWebhook } from "../src/instagram/bot.ts";
 import { GIVEAWAYS } from "../src/instagram/giveaways.ts";
+import { idle, resetQueue } from "../src/instagram/queue.ts";
 import { backfill, sweep } from "../src/instagram/sweep.ts";
+import { BUTTON } from "../src/instagram/teaser.ts";
 import { currentToken, refreshTokenIfDue } from "../src/instagram/token.ts";
-import { igTime, startMockGraph } from "./mock-graph.ts";
+import { comment, dm, OWNER, runQueue, tap } from "./events.ts";
+import { igTime, isPrivateReply, startMockGraph } from "./mock-graph.ts";
 
 const mock = await startMockGraph();
 process.env.IG_GRAPH_BASE = mock.base;
@@ -18,29 +21,12 @@ mock.state.captions.M1 = "Comment GUIDE and I'll send you the guide 👇\n\nThre
 beforeEach(() => {
   closeDb();
   openDb(":memory:");
-  mock.clear();
-  mock.state.rejectButtonsOnPrivateReply = false;
-  mock.state.expiredTokens = [];
-  mock.state.rejectPublicReplies = false;
+  resetQueue();
+  mock.reset();
   process.env.IG_ACCESS_TOKEN = "seed-token";
   delete process.env.PUBLIC_REPLIES;
 });
-
-const OWNER = "OWNER-IG";
-
-function comment(id: string, text: string, from: { id?: string; username?: string }, mediaId = "M1", parentId?: string) {
-  const value = { from, media: { id: mediaId, media_product_type: "REELS" }, id, text, ...(parentId ? { parent_id: parentId } : {}) };
-  return { object: "instagram", entry: [{ id: OWNER, time: 1, changes: [{ field: "comments", value }] }] };
-}
-
-function dm(sender: string, message: Record<string, unknown>) {
-  return {
-    object: "instagram",
-    entry: [{ id: OWNER, time: 1, messaging: [{ sender: { id: sender }, recipient: { id: OWNER }, timestamp: 1, message: { mid: "m1", ...message } }] }],
-  };
-}
-
-const tap = (sender: string, keyword: string) => dm(sender, { text: BUTTON, quick_reply: { payload: `GIVE:${keyword}` } });
+afterEach(() => idle());
 
 describe("comments", () => {
   it("answers a keyword comment with one private reply that has the button", async () => {
@@ -91,14 +77,21 @@ describe("comments", () => {
     assert.equal(mock.sent()[0].body.message.quick_replies, undefined);
   });
 
-  it("marks a comment failed when the token is bad, and retries it later", async () => {
+  it("keeps a comment in line while the token is bad, and answers it once the token works", async () => {
     mock.state.expiredTokens = ["seed-token"];
     const [result] = await handleWebhook(comment("C7", "guide", { id: "U7", username: "gina" }));
-    assert.match(result, /^failed: .*code 190/);
-    assert.equal(commentSettled("C7"), false);
+    assert.match(result, /^waiting: .*code 190/);
+    assert.equal(commentStatus("C7"), "waiting");
 
+    // The owner sets a new token. Meta sending the webhook again adds nothing:
+    // the queue tries by itself once its five-minute pause is over.
     mock.state.expiredTokens = [];
-    assert.deepEqual(await handleWebhook(comment("C7", "guide", { id: "U7", username: "gina" })), ["teaser sent: GUIDE to @gina"]);
+    assert.deepEqual(await handleWebhook(comment("C7", "guide", { id: "U7", username: "gina" })), ["skipped: already in line"]);
+    assert.equal(commentStatus("C7"), "waiting");
+    await runQueue(Date.now() + 6 * MINUTE);
+    assert.equal(commentStatus("C7"), "sent");
+    assert.deepEqual(mock.privateReplies(), ["C7"]);
+    assert.equal(mock.calls.filter(isPrivateReply).length, 2, "one turned away with the token, one sent");
   });
 });
 
@@ -122,7 +115,7 @@ describe("public reply under the comment", () => {
     mock.state.rejectPublicReplies = true;
     const [result] = await handleWebhook(comment("P4", "guide", { id: "U32", username: "cleo" }));
     assert.match(result, /^teaser sent: GUIDE to @cleo \(no public reply: /);
-    assert.equal(commentSettled("P4"), true);
+    assert.equal(commentStatus("P4"), "sent");
   });
 
   it("says nothing in public when the DM failed", async () => {
@@ -154,7 +147,7 @@ describe("DMs", () => {
 
   it("sends it once on a double tap", async () => {
     await handleWebhook(tap("U1", "GUIDE"));
-    assert.deepEqual(await handleWebhook(tap("U1", "GUIDE")), ["skipped: just sent"]);
+    assert.deepEqual(await handleWebhook(tap("U1", "GUIDE")), ["skipped: already sent or on its way"]);
   });
 
   it("answers a DM that is just a keyword, and leaves anything longer for a human", async () => {
@@ -204,7 +197,10 @@ describe("sweep and backfill", () => {
     kvSet("sweep_since", String(now - HOUR));
     assert.deepEqual(await sweep(), ["teaser sent: KEY to @bob", "teaser sent: KEY to @carol"]);
     assert.deepEqual(
-      mock.replies().map((c) => c.path),
+      mock
+        .replies()
+        .map((c) => c.path)
+        .sort(),
       ["/K1/replies", "/K4/replies"],
       "carol's keyword was a reply under K4, so her public reply goes under K4",
     );

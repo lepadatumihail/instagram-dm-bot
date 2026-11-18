@@ -1,9 +1,10 @@
 import { alert } from "../alert.ts";
-import { config, MINUTE } from "../config.ts";
-import { type CommentJob, claimComment, claimDelivery, finishComment, finishDelivery, kvGet, kvSet } from "../db.ts";
-import { GIVEAWAYS, KEYWORDS } from "./giveaways.ts";
-import { GraphError, getCaption, getMe, replyToComment, sendMessage } from "./graph.ts";
-import { captionKeywords, exactKeyword, keywordFromPayload, mentions, payloadFor } from "./match.ts";
+import { MINUTE } from "../config.ts";
+import { firstTime, kvGet, kvSet } from "../db.ts";
+import { KEYWORDS } from "./giveaways.ts";
+import { describe, getCaption, getMe } from "./graph.ts";
+import { captionKeywords, exactKeyword, keywordFromPayload, mentions } from "./match.ts";
+import { answerComment, deliver } from "./queue.ts";
 
 /**
  * The comment-to-DM flow:
@@ -22,90 +23,57 @@ import { captionKeywords, exactKeyword, keywordFromPayload, mentions, payloadFor
  * The button (a quick reply) doesn't show on Instagram on a computer, so the
  * teaser also says "Just reply GUIDE", and a DM that is only a keyword gets
  * its giveaway as well. Any other message is left for you.
+ *
+ * This file reads what comes in and decides what deserves an answer. It sends
+ * nothing itself: each teaser and giveaway goes in line, and queue.ts sends
+ * them, a few at a time and inside Meta's limits.
  */
 
-/** A few wordings, so a reel's thread isn't the same line twenty times (Instagram frowns on that). */
-const PUBLIC_REPLIES = [
-  (u: string) => `Hey @${u}, DM sent 📩`,
-  (u: string) => `@${u} sent it to your DMs 🙌`,
-  (u: string) => `@${u} check your DMs 📩`,
-  (u: string) => `Done @${u}, it's in your DMs 👀`,
-];
-
-/** The public reply for a comment: always the same wording for the same comment. */
-export function publicReplyText(username: string, commentId: string): string {
-  if (!username) return "Sent, check your DMs 📩";
-  let hash = 0;
-  for (const ch of commentId) hash = (hash * 31 + ch.charCodeAt(0)) >>> 0;
-  return PUBLIC_REPLIES[hash % PUBLIC_REPLIES.length](username);
-}
-
-export const BUTTON = "Send it over 👇";
 const CAPTION_TTL = 10 * MINUTE;
 
-export function teaser(keyword: string, withButton: boolean): string {
-  const promise = GIVEAWAYS[keyword]?.promise ?? "the link";
-  const hello = `Hey! You commented ${keyword} on my reel 🙌`;
-  return withButton
-    ? `${hello}\n\nTap the button below and I'll send you ${promise}.\n\n(No button? Just reply ${keyword}.)`
-    : `${hello}\n\nReply ${keyword} here and I'll send you ${promise}.`;
-}
-
-/**
- * The private reply. Meta's docs only show plain text in one, so the first
- * time the version with the button is turned down, the bot sends the plain
- * version and skips the button from then on.
- */
-export async function sendTeaser(commentId: string, keyword: string): Promise<void> {
-  const recipient = { comment_id: commentId };
-  const buttons = kvGet("private_reply_buttons");
-  if (buttons !== "no") {
-    try {
-      await sendMessage(recipient, {
-        text: teaser(keyword, true),
-        quick_replies: [{ content_type: "text", title: BUTTON, payload: payloadFor(keyword) }],
-      });
-      if (buttons !== "yes") kvSet("private_reply_buttons", "yes");
-      return;
-    } catch (e) {
-      // Once the button has worked, a refusal is about something else.
-      if (!(e instanceof GraphError) || e.status !== 400 || buttons === "yes") throw e;
-    }
-    await sendMessage(recipient, { text: teaser(keyword, false) });
-    kvSet("private_reply_buttons", "no");
-    return;
-  }
-  await sendMessage(recipient, { text: teaser(keyword, false) });
-}
-
-const captions = new Map<string, { keywords: string[]; at: number }>();
+const captions = new Map<string, { keywords: Promise<string[]>; at: number }>();
 
 /** Saves a reel's keywords when the caption is already at hand (the sweep lists captions). */
 export function rememberCaption(mediaId: string, keywords: string[], now = Date.now()): void {
-  captions.set(mediaId, { keywords, at: now });
+  captions.set(mediaId, { keywords: Promise.resolve(keywords), at: now });
 }
 
-/** The keywords a reel's caption asks for, looked up at most every ten minutes. */
-export async function reelKeywords(mediaId: string, now = Date.now()): Promise<string[]> {
+/**
+ * The keywords a reel's caption asks for, looked up at most every ten minutes.
+ * What's kept is the lookup itself, so a hundred comments arriving together
+ * on one reel share a single call instead of making one each.
+ */
+export function reelKeywords(mediaId: string, now = Date.now()): Promise<string[]> {
   const cached = captions.get(mediaId);
   if (cached && now - cached.at < CAPTION_TTL) return cached.keywords;
-  const keywords = captionKeywords(await getCaption(mediaId), KEYWORDS);
-  rememberCaption(mediaId, keywords, now);
+  const keywords = getCaption(mediaId).then((caption) => captionKeywords(caption, KEYWORDS));
+  captions.set(mediaId, { keywords, at: now });
+  // A lookup that failed isn't kept: the next comment asks again.
+  keywords.catch(() => {
+    if (captions.get(mediaId)?.keywords === keywords) captions.delete(mediaId);
+  });
   return keywords;
 }
 
+let asking: Promise<{ id: string; username: string }> | undefined;
+
 /** The account's own id and username, asked once and kept. */
 export async function ownAccount(): Promise<{ id: string; username: string }> {
-  let id = kvGet("own_id");
-  let username = kvGet("own_username");
-  if (id === undefined || username === undefined) {
-    const me = await getMe();
-    id = me.user_id ?? me.id ?? "";
-    username = me.username ?? "";
-    kvSet("own_id", id);
-    kvSet("own_username", username);
-  }
-  return { id, username };
+  const id = kvGet("own_id");
+  const username = kvGet("own_username");
+  if (id !== undefined && username !== undefined) return { id, username };
+  // On a fresh database, comments arriving together share one call here too.
+  asking ??= getMe()
+    .then((me) => {
+      const own = { id: me.user_id ?? me.id ?? "", username: me.username ?? "" };
+      kvSet("own_id", own.id);
+      kvSet("own_username", own.username);
+      return own;
+    })
+    .finally(() => {
+      asking = undefined;
+    });
+  return asking;
 }
 
 async function isOwner(ownerId: string, from: { id?: string; username?: string } | undefined): Promise<boolean> {
@@ -135,38 +103,13 @@ export async function handleComment(ownerId: string, value: CommentValue): Promi
   return answerComment({ commentId, mediaId, username: value.from?.username ?? "", keyword, parentId: value.parent_id });
 }
 
-/**
- * Answers a keyword comment, once: the teaser DM, then the public "DM sent"
- * reply. The public reply only goes out once the DM has, and if it fails the
- * DM still counts.
- */
-export async function answerComment(job: CommentJob): Promise<string> {
-  if (!claimComment(job)) return "skipped: already answered";
-  try {
-    await sendTeaser(job.commentId, job.keyword);
-    finishComment(job.commentId, true);
-  } catch (e) {
-    finishComment(job.commentId, false, describe(e));
-    await report(e, `couldn't send the ${job.keyword} teaser to @${job.username}`);
-    return `failed: ${describe(e)}`;
-  }
-  const sent = `teaser sent: ${job.keyword} to @${job.username}`;
-  if (!config.publicReplies) return sent;
-  try {
-    await replyToComment(job.parentId ?? job.commentId, publicReplyText(job.username, job.commentId));
-    return sent;
-  } catch (e) {
-    await report(e, `sent the ${job.keyword} DM to @${job.username}, but couldn't reply under the comment`);
-    return `${sent} (no public reply: ${describe(e)})`;
-  }
-}
-
 type MessagingEvent = {
   sender?: { id?: string };
-  message?: { text?: string; is_echo?: boolean; is_deleted?: boolean; quick_reply?: { payload?: string } };
-  postback?: { payload?: string };
+  message?: { mid?: string; text?: string; is_echo?: boolean; is_deleted?: boolean; quick_reply?: { payload?: string } };
+  postback?: { mid?: string; payload?: string };
 };
 
+/** Nothing here waits before the giveaway is in line, so one person's messages keep the order they arrived in. */
 export async function handleMessaging(ownerId: string, event: MessagingEvent): Promise<string> {
   const userId = event.sender?.id;
   if (!userId || userId === ownerId || event.message?.is_echo) return "skipped: own message";
@@ -174,22 +117,10 @@ export async function handleMessaging(ownerId: string, event: MessagingEvent): P
   const tapped = keywordFromPayload(event.message?.quick_reply?.payload ?? event.postback?.payload, KEYWORDS);
   const keyword = tapped ?? exactKeyword(event.message?.text ?? "", KEYWORDS);
   if (!keyword) return "skipped: not a keyword";
+  // Meta delivers a webhook again when it didn't get its 200, hours later if need be: a message counts the first time only.
+  const mid = event.message?.mid ?? event.postback?.mid;
+  if (mid && !firstTime(mid)) return "skipped: Meta delivered this message before";
   return deliver(userId, keyword, tapped ? "button" : "keyword");
-}
-
-/** Sends a giveaway, unless the same person got it in the last two minutes (a double tap). */
-export async function deliver(userId: string, keyword: string, via: "button" | "keyword"): Promise<string> {
-  const id = claimDelivery(userId, keyword, via);
-  if (id === null) return "skipped: just sent";
-  try {
-    for (const text of GIVEAWAYS[keyword].messages) await sendMessage({ id: userId }, { text });
-    finishDelivery(id, true);
-    return `giveaway sent: ${keyword} (${via})`;
-  } catch (e) {
-    finishDelivery(id, false, describe(e));
-    await report(e, `couldn't send the ${keyword} giveaway to someone who asked for it`);
-    return `failed: ${describe(e)}`;
-  }
 }
 
 type Entry = {
@@ -198,25 +129,30 @@ type Entry = {
   messaging?: MessagingEvent[];
 };
 
-/** One webhook delivery from Meta: comments arrive as "changes", DMs and taps as "messaging". */
+/**
+ * One webhook delivery from Meta: comments arrive as "changes", DMs and taps
+ * as "messaging". Meta can put many events in one delivery, so all of them
+ * are started before any is waited for: each goes in line straight away, and
+ * the queue decides how many are sent at a time.
+ */
 export async function handleWebhook(payload: unknown): Promise<string[]> {
   const body = payload as { object?: string; entry?: Entry[] } | null;
-  const results: string[] = [];
-  if (body?.object !== "instagram") return results;
+  const results: Promise<string>[] = [];
+  if (body?.object !== "instagram") return [];
   for (const entry of body.entry ?? []) {
     const ownerId = String(entry.id ?? "");
     for (const change of entry.changes ?? []) {
       const value = change.value;
       if (!value) continue;
-      if (change.field === "comments") results.push(await guard(() => handleComment(ownerId, value as CommentValue)));
+      if (change.field === "comments") results.push(guard(() => handleComment(ownerId, value as CommentValue)));
       // The dashboard's "Test" button sends DMs in this shape.
       if (change.field === "messages" || change.field === "messaging_postbacks") {
-        results.push(await guard(() => handleMessaging(ownerId, value as MessagingEvent)));
+        results.push(guard(() => handleMessaging(ownerId, value as MessagingEvent)));
       }
     }
-    for (const event of entry.messaging ?? []) results.push(await guard(() => handleMessaging(ownerId, event)));
+    for (const event of entry.messaging ?? []) results.push(guard(() => handleMessaging(ownerId, event)));
   }
-  return results;
+  return Promise.all(results);
 }
 
 async function guard(run: () => Promise<string>): Promise<string> {
@@ -226,24 +162,4 @@ async function guard(run: () => Promise<string>): Promise<string> {
     await alert("webhook", `an event failed: ${describe(e)}`);
     return `failed: ${describe(e)}`;
   }
-}
-
-export function describe(e: unknown): string {
-  if (e instanceof GraphError) {
-    const code = e.code ? `, code ${e.code}${e.subcode ? `/${e.subcode}` : ""}` : "";
-    return `${e.message} (HTTP ${e.status}${code})`;
-  }
-  return e instanceof Error ? e.message : String(e);
-}
-
-async function report(e: unknown, context: string): Promise<void> {
-  if (e instanceof GraphError && (e.code === 190 || e.status === 0)) {
-    await alert(
-      "token",
-      `${context}: the access token isn't working (${describe(e)}). Generate a new one in the Meta app and set IG_ACCESS_TOKEN on Railway.`,
-    );
-    return;
-  }
-  const kind = e instanceof GraphError ? `graph ${e.code ?? e.status}/${e.subcode ?? ""}` : "error";
-  await alert(kind, `${context}: ${describe(e)}`);
 }
