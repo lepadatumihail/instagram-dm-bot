@@ -1,0 +1,23 @@
+{
+  "GUIDE": {
+    "promise": "the guide",
+    "source": "guide.md",
+    "messages": [
+      "Here you go 👇\n\nThe guide: example.com/guide\n\nStart with page 2 if you're short on time."
+    ]
+  },
+  "KEY": {
+    "promise": "the checklist",
+    "source": "key.md",
+    "messages": [
+      "Here you go 👇\n\nThe checklist: example.com/checklist"
+    ]
+  },
+  "TEST": {
+    "promise": "both links",
+    "source": "test.md",
+    "messages": [
+      "Here you go 👇\n\n1. The tool: example.com/tool\n2. My settings: example.com/settings"
+    ]
+  }
+}

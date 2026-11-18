@@ -1,0 +1,22 @@
+{
+  "name": "instagram-dm-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Your own comment-to-DM bot for Instagram reels, on Instagram's official API.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": "24.x"
+  },
+  "scripts": {
+    "start": "node src/server.ts",
+    "dev": "node --watch --env-file-if-exists=.env src/server.ts",
+    "check": "tsc",
+    "test": "node --test test/*.test.ts",
+    "giveaways": "node scripts/giveaways.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "typescript": "^5.9.3"
+  }
+}
